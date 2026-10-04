@@ -1,0 +1,151 @@
+name: Build Heroes Quest Frida APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "base.apk" --dir assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "hq_split.apk" --dir assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "libfrida-gadget.so" --dir assets
+          ls -la assets/
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y unzip zip
+          curl -L -o /usr/local/bin/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
+          cat > /usr/local/bin/apktool <<'EOF'
+          #!/bin/bash
+          exec java -jar /usr/local/bin/apktool.jar "$@"
+          EOF
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+          yes | sudo sdkmanager --install "build-tools;34.0.0" > /dev/null 2>&1 || true
+          sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/zipalign" /usr/local/bin/zipalign
+          sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/apksigner" /usr/local/bin/apksigner
+
+      - name: Decode base.apk
+        run: |
+          apktool d -f -o decoded assets/base.apk
+
+      - name: Inject libs + frida gadget
+        run: |
+          mkdir -p decoded/lib/arm64-v8a
+          cd decoded/lib/arm64-v8a
+          unzip -o -j ../../../assets/hq_split.apk "lib/arm64-v8a/*"
+          cd ../../..
+          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/
+          cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so <<'EOF'
+          {
+            "interaction": {
+              "type": "listen",
+              "address": "127.0.0.1",
+              "port": 27042,
+              "on_load": "resume"
+            }
+          }
+          EOF
+          ls -la decoded/lib/arm64-v8a/
+
+      - name: Strip split attributes
+        run: |
+          python3 <<'PY'
+          import re
+          path = 'decoded/AndroidManifest.xml'
+          data = open(path).read()
+          data = re.sub(r'\s+android:requiredSplitTypes="[^"]*"', '', data)
+          data = re.sub(r'\s+android:splitTypes="[^"]*"', '', data)
+          data = re.sub(r'\s+android:isSplitRequired="[^"]*"', '', data)
+          open(path, 'w').write(data)
+          print("stripped")
+          PY
+
+      - name: Patch launcher activity
+        run: |
+          python3 <<'PY'
+          import re, os, glob
+
+          manifest = open('decoded/AndroidManifest.xml').read()
+          target = None
+          for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
+              nm = re.search(r'android:name="([^"]+)"', m.group(1))
+              if not nm: continue
+              snippet = manifest[m.end():m.end()+1500]
+              if 'android.intent.action.MAIN' in snippet and 'android.intent.category.LAUNCHER' in snippet:
+                  target = nm.group(1); break
+          if not target:
+              for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
+                  nm = re.search(r'android:name="([^"]+)"', m.group(1))
+                  if nm and 'UnityPlayer' in nm.group(1):
+                      target = nm.group(1); break
+          if not target:
+              raise SystemExit("No launcher activity")
+
+          smali_path = target.replace('.', '/') + '.smali'
+          found = None
+          for d in sorted(glob.glob('decoded/smali*')):
+              c = os.path.join(d, smali_path)
+              if os.path.exists(c):
+                  found = c; break
+          if not found:
+              raise SystemExit("Smali not found")
+
+          content = open(found).read()
+          pattern = r'(\.method[^\n]*\bonCreate\b[^\n]*\n(?:[^\n]*\n)*?    \.locals\s+)(\d+)'
+          match = re.search(pattern, content)
+          if not match:
+              raise SystemExit("No onCreate with .locals")
+
+          old_n = int(match.group(2))
+          new_n = old_n + 1
+          reg = "v" + str(old_n)
+          print("locals: " + str(old_n) + " -> " + str(new_n))
+
+          content = content[:match.start(2)] + str(new_n) + content[match.end(2):]
+          m2 = re.search(r'    \.locals\s+' + str(new_n) + r'\n', content)
+          inject = (
+              '    const-string ' + reg + ', "frida-gadget"\n'
+              '    invoke-static {' + reg + '}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+          )
+          content = content[:m2.end()] + inject + content[m2.end():]
+          open(found, 'w').write(content)
+          print("patched")
+          PY
+
+      - name: Build APK
+        run: |
+          apktool b decoded --use-aapt2 -o unsigned.apk
+          ls -la unsigned.apk
+
+      - name: Sign
+        run: |
+          keytool -genkey -v -keystore ks.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias key -storepass 123456 -keypass 123456 \
+            -dname "CN=H, OU=H, O=H, L=H, ST=H, C=US"
+          zipalign -v -p 4 unsigned.apk aligned.apk || cp unsigned.apk aligned.apk
+          apksigner sign --ks ks.jks --ks-pass pass:123456 --key-pass pass:123456 \
+            --out HeroesQuest-Frida.apk aligned.apk
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeroesQuest-Frida
+          path: HeroesQuest-Frida.apk
+          retention-days: 7
